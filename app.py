@@ -1,5 +1,5 @@
-from challengeController import app
+from challengeController import main
+import asyncio
 
-# If this file is run directly
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    asyncio.run(main())
