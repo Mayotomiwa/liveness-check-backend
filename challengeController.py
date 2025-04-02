@@ -8,13 +8,19 @@ import os
 import random
 import json
 import logging
+import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("liveness-detector")
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# Constants
+CHALLENGE_TIMEOUT = 50  # 50 seconds per challenge
+PING_INTERVAL = 20      # Send ping every 20 seconds
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -307,26 +313,60 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session_id = None
     detector = None
+    challenge_timer = None
     
+    async def reset_challenge_timer():
+        nonlocal challenge_timer
+        if challenge_timer:
+            challenge_timer.cancel()
+        challenge_timer = asyncio.create_task(
+            asyncio.sleep(CHALLENGE_TIMEOUT)
+        )
+        try:
+            await challenge_timer
+            await websocket.send_text(json.dumps({
+                'type': 'error',
+                'message': f'Challenge timed out after {CHALLENGE_TIMEOUT} seconds'
+            }))
+            await websocket.close(code=1008)  # Policy violation
+        except asyncio.CancelledError:
+            pass
+
     try:
-        # Wait for initialization message
-        data = await websocket.receive_text()
+        # Initial handshake with timeout
+        try:
+            data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+        except asyncio.TimeoutError:
+            await websocket.close(code=1008)
+            return
+
         init_data = json.loads(data)
         
+        if init_data.get('type') == 'ping':
+            await websocket.send_text(json.dumps({'type': 'pong'}))
+            return
+            
         if init_data.get('type') == 'init':
-            # Verify API key if needed
+            # API Key verification
             if init_data.get('apiKey') != 'liveness_detection_key_2025':
                 await websocket.send_text(json.dumps({
                     'type': 'error',
                     'message': 'Invalid API key'
                 }))
+                await websocket.close(code=4001)
                 return
             
             # Initialize session
             session_id = f"session_{random.randint(10000, 99999)}"
             detector = LivenessDetector()
             challenges = detector.generate_challenges(3)
-            active_sessions[session_id] = detector
+            active_sessions[session_id] = {
+                'detector': detector,
+                'last_active': asyncio.get_event_loop().time()
+            }
+            
+            # Start challenge timer
+            await reset_challenge_timer()
             
             # Send session info
             await websocket.send_text(json.dumps({
@@ -334,82 +374,136 @@ async def websocket_endpoint(websocket: WebSocket):
                 'sessionId': session_id,
                 'challenges': challenges,
                 'currentChallenge': detector.get_current_challenge(),
-                'instructions': get_challenge_instructions(detector.get_current_challenge())
+                'instructions': get_challenge_instructions(detector.get_current_challenge()),
+                'timeout': CHALLENGE_TIMEOUT
             }))
             
-            # Process frames
+            # Start ping task
+            async def send_pings():
+                while True:
+                    await asyncio.sleep(PING_INTERVAL)
+                    try:
+                        await websocket.send_text(json.dumps({'type': 'ping'}))
+                    except:
+                        break
+            
+            ping_task = asyncio.create_task(send_pings())
+            
+            # Main processing loop
             while True:
-                data = await websocket.receive_text()
-                frame_data = json.loads(data)
-                
-                if frame_data.get('type') != 'frame':
-                    continue
-                
-                # Decode image
                 try:
-                    image_data = base64.b64decode(frame_data['image'])
-                    image = Image.open(io.BytesIO(image_data))
-                    np_image = np.array(image)
-                    if len(np_image.shape) == 3 and np_image.shape[2] == 3:
-                        np_image = cv2.cvtColor(np_image, cv2.COLOR_RGB2BGR)
-                except Exception as e:
-                    logger.error(f"Image decode error: {str(e)}")
+                    data = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=CHALLENGE_TIMEOUT + 10  # Slightly longer than challenge timeout
+                    )
+                    
+                    message = json.loads(data)
+                    active_sessions[session_id]['last_active'] = asyncio.get_event_loop().time()
+                    
+                    # Handle ping messages
+                    if message.get('type') == 'ping':
+                        await websocket.send_text(json.dumps({'type': 'pong'}))
+                        continue
+                        
+                    # Process frame messages
+                    if message.get('type') == 'frame':
+                        # Reset timer for each frame received
+                        await reset_challenge_timer()
+                        
+                        try:
+                            image_data = base64.b64decode(message['image'])
+                            image = Image.open(io.BytesIO(image_data))
+                            np_image = np.array(image)
+                            if len(np_image.shape) == 3 and np_image.shape[2] == 3:
+                                np_image = cv2.cvtColor(np_image, cv2.COLOR_RGB2BGR)
+                                
+                            # Process frame
+                            face_detected, face_result = detector.detect_face(np_image)
+                            if not face_detected:
+                                await websocket.send_text(json.dumps({
+                                    'type': 'verification',
+                                    'success': False,
+                                    'message': face_result
+                                }))
+                                continue
+                                
+                            success, message = detector.verify_challenge(np_image)
+                            response = {
+                                'type': 'verification',
+                                'success': success,
+                                'message': message,
+                                'currentChallenge': detector.get_current_challenge(),
+                                'instructions': get_challenge_instructions(detector.get_current_challenge()),
+                                'challengesCompleted': list(detector.completed_challenges),
+                                'challengesTotal': len(detector.current_challenges),
+                                'allCompleted': detector.is_liveness_verified(),
+                                'timeRemaining': CHALLENGE_TIMEOUT  # Inform client of timeout
+                            }
+                            await websocket.send_text(json.dumps(response))
+                            
+                            if detector.is_liveness_verified():
+                                ping_task.cancel()
+                                await websocket.send_text(json.dumps({
+                                    'type': 'complete',
+                                    'success': True,
+                                    'message': "Liveness verification complete"
+                                }))
+                                break
+                                
+                        except Exception as e:
+                            logger.error(f"Frame processing error: {str(e)}")
+                            await websocket.send_text(json.dumps({
+                                'type': 'error',
+                                'message': 'Frame processing failed'
+                            }))
+                    
+                except asyncio.TimeoutError:
+                    logger.info(f"Challenge timeout for session {session_id}")
                     await websocket.send_text(json.dumps({
                         'type': 'error',
-                        'message': 'Invalid image data'
+                        'message': f'No activity for {CHALLENGE_TIMEOUT} seconds'
                     }))
-                    continue
-                
-                # Process frame
-                face_detected, face_result = detector.detect_face(np_image)
-                if not face_detected:
-                    await websocket.send_text(json.dumps({
-                        'type': 'verification',
-                        'success': False,
-                        'message': face_result
-                    }))
-                    continue
-                
-                success, message = detector.verify_challenge(np_image)
-                response = {
-                    'type': 'verification',
-                    'success': success,
-                    'message': message,
-                    'currentChallenge': detector.get_current_challenge(),
-                    'instructions': get_challenge_instructions(detector.get_current_challenge()),
-                    'challengesCompleted': list(detector.completed_challenges),
-                    'challengesTotal': len(detector.current_challenges),
-                    'allCompleted': detector.is_liveness_verified()
-                }
-                await websocket.send_text(json.dumps(response))
-                
-                if detector.is_liveness_verified():
-                    await websocket.send_text(json.dumps({
-                        'type': 'complete',
-                        'success': True,
-                        'message': "Liveness verification complete"
-                    }))
+                    await websocket.close(code=1008)
                     break
-    
-    except WebSocketDisconnect:
-        logger.info(f"Client disconnected: {session_id}")
+                    
+    except WebSocketDisconnect as e:
+        logger.info(f"Client disconnected: {session_id} (code: {e.code})")
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON received")
+        await websocket.close(code=4000)
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         await websocket.send_text(json.dumps({
             'type': 'error',
             'message': f"Server error: {str(e)}"
         }))
     finally:
+        if challenge_timer and not challenge_timer.done():
+            challenge_timer.cancel()
         if session_id in active_sessions:
             del active_sessions[session_id]
+        try:
+            await websocket.close()
+        except:
+            pass
+        try:
+            ping_task.cancel()
+        except:
+            pass
 
 async def main():
     import uvicorn
     config = uvicorn.Config(
         "challengeController:app",
         host="0.0.0.0",
-        port=5000,
-        log_level="info"
+        port=10000,  # Render requires port 10000
+        log_level="info",
+        timeout_keep_alive=60,  # Keep-alive timeout
+        ws_ping_interval=20,    # Ping interval
+        ws_ping_timeout=30      # Ping timeout
     )
     server = uvicorn.Server(config)
     await server.serve()
+
+if __name__ == "__main__":
+    asyncio.run(main())
