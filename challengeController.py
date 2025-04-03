@@ -316,7 +316,7 @@ class LivenessDetector:
         
         # Keep track of movement history for stability analysis
         self.movement_history.append(movement)
-        if len(self.movement_history) > 30:  # Track last 30 frames
+        if len(self.movement_history) > 10:  # Track last 30 frames
             self.movement_history.pop(0)
         
         # Check if movement is below threshold (stable position)
