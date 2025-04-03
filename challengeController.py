@@ -70,7 +70,7 @@ class LivenessDetector:
         # For action verification
         self.last_detected_action = None
         self.action_detection_counter = 0
-        self.consecutive_action_threshold = 3  # Require multiple consecutive detections
+        self.consecutive_action_threshold = 2  # Reduced from 3 to 2
         
         # For blink detection
         self.ear_history = []
@@ -199,25 +199,25 @@ class LivenessDetector:
         left_ear = self._calculate_ear(landmarks["left_eye"])
         right_ear = self._calculate_ear(landmarks["right_eye"])
         
-        # Lower threshold makes it harder to trigger accidentally
-        threshold = 0.18  # Reduced from 0.2
+        # Increased threshold makes it easier to detect blinks
+        threshold = 0.23  # Increased from 0.18
         
         # Store historical EAR values to detect an actual blink sequence
         avg_ear = (left_ear + right_ear) / 2
         self.ear_history.append(avg_ear)
-        if len(self.ear_history) > 10:  # Keep last 10 frames
+        if len(self.ear_history) > 15:  # Keep more frames (increased from 10)
             self.ear_history.pop(0)
         
-        # Detect blink only if we see a decrease followed by increase (actual blink)
+        # More flexible blink detection
         blink_detected = False
-        if len(self.ear_history) >= 5:
-            # Check for pattern: normal -> closed -> normal
-            if (self.ear_history[-5] > threshold and  # Open before
-                min(self.ear_history[-4:-1]) < threshold and  # Closed during
-                self.ear_history[-1] > threshold):  # Open after
+        if len(self.ear_history) >= 4:  # Reduced from 5 to 4 frames
+            # More lenient pattern detection
+            if (max(self.ear_history[:-3]) > threshold and  # Was open earlier
+                min(self.ear_history[-3:-1]) < threshold and  # Closed during
+                self.ear_history[-1] > threshold * 0.9):  # Opening (with some tolerance)
                 blink_detected = True
         
-        # Detect blink
+        # Detect blink with decay for intermittent detection
         if blink_detected:
             # Check if we're consistently detecting the same action
             if self.last_detected_action == "blink":
@@ -229,6 +229,10 @@ class LivenessDetector:
             # Only return true if we've seen the action multiple times
             if self.action_detection_counter >= self.consecutive_action_threshold:
                 return True, "Blink detected"
+        else:
+            # Add decay instead of immediate reset
+            if self.last_detected_action == "blink" and self.action_detection_counter > 0:
+                self.action_detection_counter = max(0, self.action_detection_counter - 0.5)
                 
         return False, "No blink detected"
     
@@ -245,7 +249,7 @@ class LivenessDetector:
         
         # Store position history
         self.position_history.append((curr_x, curr_y))
-        if len(self.position_history) > 15:  # Keep last 15 positions
+        if len(self.position_history) > 20:  # Keep more frames (increased from 15)
             self.position_history.pop(0)
         
         # If we don't have enough history yet, just return
@@ -264,33 +268,33 @@ class LivenessDetector:
             
             # For right turn: need rightward movement (increasing x)
             if movement_type == "turn_right":
-                # Check for consistent rightward movement
-                if (x_positions[-1] - x_positions[0]) > 20:  # Significant rightward movement
-                    # Ensure it's not oscillating/waving
-                    is_consistent = all(x_positions[i] <= x_positions[i+1] + 5 for i in range(len(x_positions)-1))
-                    if is_consistent:
+                # Reduced threshold from 20 to 15 pixels
+                if (x_positions[-1] - x_positions[0]) > 15:  # Significant rightward movement
+                    # More tolerant consistency check
+                    consistent_count = sum(1 for i in range(len(x_positions)-1) if x_positions[i] <= x_positions[i+1] + 8)
+                    if consistent_count >= len(x_positions) * 0.7:  # Only require 70% consistency
                         action_detected = True
                         detected_action = "turn_right"
                         message = "Right turn detected"
             
             # For left turn: need leftward movement (decreasing x)
             elif movement_type == "turn_left":
-                # Check for consistent leftward movement
-                if (x_positions[0] - x_positions[-1]) > 20:  # Significant leftward movement
-                    # Ensure it's not oscillating/waving
-                    is_consistent = all(x_positions[i] >= x_positions[i+1] - 5 for i in range(len(x_positions)-1))
-                    if is_consistent:
+                # Reduced threshold from 20 to 15 pixels
+                if (x_positions[0] - x_positions[-1]) > 15:  # Significant leftward movement
+                    # More tolerant consistency check
+                    consistent_count = sum(1 for i in range(len(x_positions)-1) if x_positions[i] >= x_positions[i+1] - 8)
+                    if consistent_count >= len(x_positions) * 0.7:  # Only require 70% consistency
                         action_detected = True
                         detected_action = "turn_left"
                         message = "Left turn detected"
         
-        # Handle nodding similar to the original code
+        # Handle nodding with similar improvements
         elif movement_type == "nod":
             # Calculate y positions
             y_positions = [pos[1] for pos in self.position_history[-10:]]
-            # Need to see up-down movement
+            # Reduced threshold from 15 to 12
             y_range = max(y_positions) - min(y_positions)
-            if y_range > 15:
+            if y_range > 12:
                 action_detected = True
                 detected_action = "nod"
                 message = "Nod detected"
@@ -310,12 +314,12 @@ class LivenessDetector:
                 self.previous_landmarks = None
                 return True, message
         else:
-            self.action_detection_counter = 0
-            self.last_detected_action = None
+            # Decay instead of immediate reset
+            if self.last_detected_action == movement_type and self.action_detection_counter > 0:
+                self.action_detection_counter = max(0, self.action_detection_counter - 0.5)
         
         self.previous_landmarks = landmarks
         return False, "Continue " + get_challenge_instructions(movement_type).lower()
-    
     def verify_still(self, image_data):
         """Verify the user is staying still for the final verification step"""
         landmarks = self.get_facial_landmarks(image_data)
