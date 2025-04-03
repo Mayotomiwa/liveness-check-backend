@@ -27,6 +27,8 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 CHALLENGE_TIMEOUT = 50  # 50 seconds per challenge
 PING_INTERVAL = 15      # Send ping every 15 seconds (Render free tier needs frequent pings)
 CONNECTION_TIMEOUT = 60  # Overall connection timeout
+MAX_MULTIPLE_FACE_DETECTIONS = 3  # After this many detections of multiple faces, fail verification
+VERIFICATION_FAILED_FLAG = "verification_failed"  # Flag for permanently failed verification
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -60,6 +62,15 @@ class LivenessDetector:
         self.initial_face_position = None
         self.movement_history = []
         
+        # Face verification counters
+        self.multiple_face_counter = 0
+        self.verification_failed = False
+        
+        # For action verification
+        self.last_detected_action = None
+        self.action_detection_counter = 0
+        self.consecutive_action_threshold = 3  # Require multiple consecutive detections
+        
     def generate_challenges(self, num_challenges=3):
         """Generate a sequence of random liveness challenges"""
         # Make sure we don't repeat challenges
@@ -67,10 +78,14 @@ class LivenessDetector:
         self.challenge_index = 0
         self.completed_challenges = set()
         self.final_verification_complete = False
+        self.verification_failed = False
+        self.multiple_face_counter = 0
         return self.current_challenges
     
     def get_current_challenge(self):
         """Get the current active challenge"""
+        if self.verification_failed:
+            return VERIFICATION_FAILED_FLAG
         if self.challenge_index < len(self.current_challenges):
             return self.current_challenges[self.challenge_index]
         return "stay_still"  # Final verification step
@@ -88,7 +103,15 @@ class LivenessDetector:
         
         # Only allow one face
         if len(results.multi_face_landmarks) > 1:
-            return False, "Multiple faces detected"
+            self.multiple_face_counter += 1
+            # If multiple faces detected too many times, fail verification permanently
+            if self.multiple_face_counter >= MAX_MULTIPLE_FACE_DETECTIONS:
+                self.verification_failed = True
+                return False, "Verification failed: Multiple faces detected repeatedly"
+            return False, f"Multiple faces detected ({self.multiple_face_counter}/{MAX_MULTIPLE_FACE_DETECTIONS})"
+        else:
+            # Reset counter if only one face is detected
+            self.multiple_face_counter = 0
             
         # Get image dimensions for normalization
         height, width = image_data.shape[:2]
@@ -167,9 +190,20 @@ class LivenessDetector:
         
         # If EAR is below threshold, eyes are closed (blink detected)
         threshold = 0.2
+        
+        # Detect blink
         if left_ear < threshold and right_ear < threshold:
-            return True, "Blink detected"
-            
+            # Check if we're consistently detecting the same action
+            if self.last_detected_action == "blink":
+                self.action_detection_counter += 1
+            else:
+                self.last_detected_action = "blink"
+                self.action_detection_counter = 1
+                
+            # Only return true if we've seen the action multiple times
+            if self.action_detection_counter >= self.consecutive_action_threshold:
+                return True, "Blink detected"
+                
         return False, "No blink detected"
     
     def detect_head_movement(self, image_data, movement_type):
@@ -184,32 +218,77 @@ class LivenessDetector:
             self.previous_landmarks = landmarks
             return False, "Initial position captured"
         
+        action_detected = False
+        message = "No movement detected"
+        detected_action = None
+        
+        # Get nose positions
+        prev_x = sum(point[0] for point in self.previous_landmarks["nose_tip"]) / len(self.previous_landmarks["nose_tip"])
+        curr_x = sum(point[0] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
+        prev_y = sum(point[1] for point in self.previous_landmarks["nose_tip"]) / len(self.previous_landmarks["nose_tip"])
+        curr_y = sum(point[1] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
+        
+        # Calculate position changes
+        dx = curr_x - prev_x
+        dy = curr_y - prev_y
+        
+        # Detect actual movement regardless of what was requested
         if movement_type == "nod":
             # Check vertical movement (y-coordinate changes)
-            prev_y = sum(point[1] for point in self.previous_landmarks["nose_tip"]) / len(self.previous_landmarks["nose_tip"])
-            curr_y = sum(point[1] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
-            
-            # Threshold for detecting vertical movement
-            if abs(curr_y - prev_y) > 15:
-                self.previous_landmarks = None  # Reset
-                return True, "Nod detected"
+            if abs(dy) > 15:
+                action_detected = True
+                detected_action = "nod"
+                message = "Nod detected"
                 
-        elif movement_type in ["turn_right", "turn_left"]:
-            # Check horizontal movement (x-coordinate changes)
-            prev_x = sum(point[0] for point in self.previous_landmarks["nose_tip"]) / len(self.previous_landmarks["nose_tip"])
-            curr_x = sum(point[0] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
-            
-            # Threshold for detecting horizontal movement
-            if movement_type == "turn_right" and (curr_x - prev_x) > 15:
-                self.previous_landmarks = None  # Reset
-                return True, "Right turn detected"
-            elif movement_type == "turn_left" and (prev_x - curr_x) > 15:
-                self.previous_landmarks = None  # Reset
-                return True, "Left turn detected"
+        elif movement_type == "turn_right":
+            # Check if actually turned right (positive x change)
+            if dx > 15:
+                action_detected = True
+                detected_action = "turn_right"
+                message = "Right turn detected"
+            # Check if turned the wrong way (left instead of right)
+            elif dx < -15:
+                action_detected = False
+                detected_action = "turn_left"  # Detected wrong action
+                message = "Wrong direction: turned left instead of right"
+                
+        elif movement_type == "turn_left":
+            # Check if actually turned left (negative x change)
+            if dx < -15:
+                action_detected = True
+                detected_action = "turn_left"
+                message = "Left turn detected"
+            # Check if turned the wrong way (right instead of left)
+            elif dx > 15:
+                action_detected = False
+                detected_action = "turn_right"  # Detected wrong action
+                message = "Wrong direction: turned right instead of left"
         
-        # Update landmarks for next comparison
-        self.previous_landmarks = landmarks
-        return False, "No movement detected"
+        # Update landmarks for next comparison if no significant movement
+        if not detected_action:
+            self.previous_landmarks = landmarks
+            self.last_detected_action = None
+            self.action_detection_counter = 0
+            return False, "No movement detected"
+            
+        # Check if we're consistently detecting the same action
+        if self.last_detected_action == detected_action:
+            self.action_detection_counter += 1
+        else:
+            self.last_detected_action = detected_action
+            self.action_detection_counter = 1
+        
+        # If we detect the wrong action consistently, reject it
+        if detected_action != movement_type and self.action_detection_counter >= self.consecutive_action_threshold:
+            self.previous_landmarks = None  # Reset for fresh start
+            return False, message
+            
+        # Only return true if we've seen the correct action multiple times consistently
+        if action_detected and detected_action == movement_type and self.action_detection_counter >= self.consecutive_action_threshold:
+            self.previous_landmarks = None  # Reset
+            return True, message
+            
+        return False, "Continue " + get_challenge_instructions(movement_type).lower()
     
     def verify_still(self, image_data):
         """Verify the user is staying still for the final verification step"""
@@ -241,12 +320,13 @@ class LivenessDetector:
             self.movement_history.pop(0)
         
         # Check if movement is below threshold (stable position)
+        # FIXED: Reduced required stable frames from 15 to 10
         threshold = 10  # Threshold for considering movement insignificant
-        if len(self.movement_history) >= 15 and all(m < threshold for m in self.movement_history[-15:]):
+        if len(self.movement_history) >= 10 and all(m < threshold for m in self.movement_history[-10:]):
             self.final_verification_complete = True
             return True, "Verification complete - user is staying still"
             
-        return False, "Continue staying still"
+        return False, f"Continue staying still ({len(self.movement_history)}/10 frames)"
     
     def _calculate_ear(self, eye_points):
         """Calculate Eye Aspect Ratio for blink detection"""
@@ -272,6 +352,10 @@ class LivenessDetector:
         """Verify if the current challenge was completed successfully"""
         current_challenge = self.get_current_challenge()
         
+        # If verification has failed permanently, don't process further
+        if current_challenge == VERIFICATION_FAILED_FLAG:
+            return False, "Verification failed due to security concerns"
+            
         # If all challenges are completed, do the final verification
         if current_challenge == "stay_still":
             return self.verify_still(image_data)
@@ -289,6 +373,10 @@ class LivenessDetector:
             return False, "Unknown challenge"
             
         if result:
+            # Reset action detection counters
+            self.last_detected_action = None
+            self.action_detection_counter = 0
+            
             # Mark this challenge as completed
             self.completed_challenges.add(current_challenge)
             # Move to the next challenge if this one is completed
@@ -300,6 +388,8 @@ class LivenessDetector:
         
     def is_liveness_verified(self):
         """Check if all challenges have been completed and final verification is done"""
+        if self.verification_failed:
+            return False
         return (len(self.completed_challenges) == len(self.current_challenges) and 
                 self.final_verification_complete)
 
@@ -310,7 +400,8 @@ def get_challenge_instructions(challenge):
         "nod": "Please nod your head up and down",
         "turn_right": "Please turn your head to the right",
         "turn_left": "Please turn your head to the left",
-        "stay_still": "Please stay still for final verification"
+        "stay_still": "Please stay still for final verification",
+        VERIFICATION_FAILED_FLAG: "Verification failed. Please restart the process."
     }
     return instructions.get(challenge, "Follow the instructions on screen")
 
@@ -432,19 +523,41 @@ async def websocket_endpoint(websocket: WebSocket):
                                     
                                 # Verification logic
                                 face_detected, face_result = detector.detect_face(np_image)
+                                
+                                # Handle failed verification permanently
+                                if detector.verification_failed:
+                                    await websocket.send_text(json.dumps({
+                                        'type': 'verification',
+                                        'success': False,
+                                        'message': "Verification failed due to security concerns",
+                                        'currentChallenge': VERIFICATION_FAILED_FLAG,
+                                        'instructions': get_challenge_instructions(VERIFICATION_FAILED_FLAG),
+                                        'challengesCompleted': list(detector.completed_challenges),
+                                        'challengesTotal': len(detector.current_challenges),
+                                        'allCompleted': False,
+                                        'verificationFailed': True
+                                    }))
+                                    # End the session after a permanent failure
+                                    await websocket.close(code=4002)
+                                    break
+                                
                                 if not face_detected:
                                     await websocket.send_text(json.dumps({
                                         'type': 'verification',
                                         'success': False,
-                                        'message': face_result
+                                        'message': face_result,
+                                        'currentChallenge': detector.get_current_challenge(),
+                                        'instructions': get_challenge_instructions(detector.get_current_challenge()),
+                                        'challengesCompleted': list(detector.completed_challenges),
+                                        'challengesTotal': len(detector.current_challenges)
                                     }))
                                     continue
                                     
-                                success, message = detector.verify_challenge(np_image)
+                                success, message_text = detector.verify_challenge(np_image)
                                 response = {
                                     'type': 'verification',
                                     'success': success,
-                                    'message': message,
+                                    'message': message_text,
                                     'currentChallenge': detector.get_current_challenge(),
                                     'instructions': get_challenge_instructions(detector.get_current_challenge()),
                                     'challengesCompleted': list(detector.completed_challenges),
