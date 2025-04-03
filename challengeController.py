@@ -61,6 +61,7 @@ class LivenessDetector:
         # Store initial face position for the final verification
         self.initial_face_position = None
         self.movement_history = []
+        self.stable_frame_count = 0
         
         # Face verification counters
         self.multiple_face_counter = 0
@@ -71,6 +72,12 @@ class LivenessDetector:
         self.action_detection_counter = 0
         self.consecutive_action_threshold = 3  # Require multiple consecutive detections
         
+        # For blink detection
+        self.ear_history = []
+        
+        # For turn detection
+        self.position_history = []
+        
     def generate_challenges(self, num_challenges=3):
         """Generate a sequence of random liveness challenges"""
         # Make sure we don't repeat challenges
@@ -80,6 +87,10 @@ class LivenessDetector:
         self.final_verification_complete = False
         self.verification_failed = False
         self.multiple_face_counter = 0
+        self.ear_history = []
+        self.position_history = []
+        self.movement_history = []
+        self.stable_frame_count = 0
         return self.current_challenges
     
     def get_current_challenge(self):
@@ -188,11 +199,26 @@ class LivenessDetector:
         left_ear = self._calculate_ear(landmarks["left_eye"])
         right_ear = self._calculate_ear(landmarks["right_eye"])
         
-        # If EAR is below threshold, eyes are closed (blink detected)
-        threshold = 0.2
+        # Lower threshold makes it harder to trigger accidentally
+        threshold = 0.18  # Reduced from 0.2
+        
+        # Store historical EAR values to detect an actual blink sequence
+        avg_ear = (left_ear + right_ear) / 2
+        self.ear_history.append(avg_ear)
+        if len(self.ear_history) > 10:  # Keep last 10 frames
+            self.ear_history.pop(0)
+        
+        # Detect blink only if we see a decrease followed by increase (actual blink)
+        blink_detected = False
+        if len(self.ear_history) >= 5:
+            # Check for pattern: normal -> closed -> normal
+            if (self.ear_history[-5] > threshold and  # Open before
+                min(self.ear_history[-4:-1]) < threshold and  # Closed during
+                self.ear_history[-1] > threshold):  # Open after
+                blink_detected = True
         
         # Detect blink
-        if left_ear < threshold and right_ear < threshold:
+        if blink_detected:
             # Check if we're consistently detecting the same action
             if self.last_detected_action == "blink":
                 self.action_detection_counter += 1
@@ -213,81 +239,81 @@ class LivenessDetector:
         if not landmarks or "nose_tip" not in landmarks:
             return False, "No facial landmarks detected"
         
-        # If no previous landmarks, store current and return
-        if self.previous_landmarks is None:
+        # Get nose position
+        curr_x = sum(point[0] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
+        curr_y = sum(point[1] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
+        
+        # Store position history
+        self.position_history.append((curr_x, curr_y))
+        if len(self.position_history) > 15:  # Keep last 15 positions
+            self.position_history.pop(0)
+        
+        # If we don't have enough history yet, just return
+        if len(self.position_history) < 5:
             self.previous_landmarks = landmarks
-            return False, "Initial position captured"
+            return False, "Collecting initial position data"
         
         action_detected = False
         message = "No movement detected"
         detected_action = None
         
-        # Get nose positions
-        prev_x = sum(point[0] for point in self.previous_landmarks["nose_tip"]) / len(self.previous_landmarks["nose_tip"])
-        curr_x = sum(point[0] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
-        prev_y = sum(point[1] for point in self.previous_landmarks["nose_tip"]) / len(self.previous_landmarks["nose_tip"])
-        curr_y = sum(point[1] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
+        # For turn detection, analyze the movement sequence
+        if movement_type in ["turn_right", "turn_left"]:
+            # Calculate x positions (last several frames)
+            x_positions = [pos[0] for pos in self.position_history[-10:]]
+            
+            # For right turn: need rightward movement (increasing x)
+            if movement_type == "turn_right":
+                # Check for consistent rightward movement
+                if (x_positions[-1] - x_positions[0]) > 20:  # Significant rightward movement
+                    # Ensure it's not oscillating/waving
+                    is_consistent = all(x_positions[i] <= x_positions[i+1] + 5 for i in range(len(x_positions)-1))
+                    if is_consistent:
+                        action_detected = True
+                        detected_action = "turn_right"
+                        message = "Right turn detected"
+            
+            # For left turn: need leftward movement (decreasing x)
+            elif movement_type == "turn_left":
+                # Check for consistent leftward movement
+                if (x_positions[0] - x_positions[-1]) > 20:  # Significant leftward movement
+                    # Ensure it's not oscillating/waving
+                    is_consistent = all(x_positions[i] >= x_positions[i+1] - 5 for i in range(len(x_positions)-1))
+                    if is_consistent:
+                        action_detected = True
+                        detected_action = "turn_left"
+                        message = "Left turn detected"
         
-        # Calculate position changes
-        dx = curr_x - prev_x
-        dy = curr_y - prev_y
-        
-        # Detect actual movement regardless of what was requested
-        if movement_type == "nod":
-            # Check vertical movement (y-coordinate changes)
-            if abs(dy) > 15:
+        # Handle nodding similar to the original code
+        elif movement_type == "nod":
+            # Calculate y positions
+            y_positions = [pos[1] for pos in self.position_history[-10:]]
+            # Need to see up-down movement
+            y_range = max(y_positions) - min(y_positions)
+            if y_range > 15:
                 action_detected = True
                 detected_action = "nod"
                 message = "Nod detected"
-                
-        elif movement_type == "turn_right":
-            # Check if actually turned right (positive x change)
-            if dx > 15:
-                action_detected = True
-                detected_action = "turn_right"
-                message = "Right turn detected"
-            # Check if turned the wrong way (left instead of right)
-            elif dx < -15:
-                action_detected = False
-                detected_action = "turn_left"  # Detected wrong action
-                message = "Wrong direction: turned left instead of right"
-                
-        elif movement_type == "turn_left":
-            # Check if actually turned left (negative x change)
-            if dx < -15:
-                action_detected = True
-                detected_action = "turn_left"
-                message = "Left turn detected"
-            # Check if turned the wrong way (right instead of left)
-            elif dx > 15:
-                action_detected = False
-                detected_action = "turn_right"  # Detected wrong action
-                message = "Wrong direction: turned right instead of left"
         
-        # Update landmarks for next comparison if no significant movement
-        if not detected_action:
-            self.previous_landmarks = landmarks
-            self.last_detected_action = None
-            self.action_detection_counter = 0
-            return False, "No movement detected"
-            
         # Check if we're consistently detecting the same action
-        if self.last_detected_action == detected_action:
-            self.action_detection_counter += 1
+        if detected_action == movement_type:
+            if self.last_detected_action == detected_action:
+                self.action_detection_counter += 1
+            else:
+                self.last_detected_action = detected_action
+                self.action_detection_counter = 1
+            
+            # Only return true if we've seen the action multiple times
+            if self.action_detection_counter >= self.consecutive_action_threshold:
+                # Reset for next challenge
+                self.position_history = []
+                self.previous_landmarks = None
+                return True, message
         else:
-            self.last_detected_action = detected_action
-            self.action_detection_counter = 1
+            self.action_detection_counter = 0
+            self.last_detected_action = None
         
-        # If we detect the wrong action consistently, reject it
-        if detected_action != movement_type and self.action_detection_counter >= self.consecutive_action_threshold:
-            self.previous_landmarks = None  # Reset for fresh start
-            return False, message
-            
-        # Only return true if we've seen the correct action multiple times consistently
-        if action_detected and detected_action == movement_type and self.action_detection_counter >= self.consecutive_action_threshold:
-            self.previous_landmarks = None  # Reset
-            return True, message
-            
+        self.previous_landmarks = landmarks
         return False, "Continue " + get_challenge_instructions(movement_type).lower()
     
     def verify_still(self, image_data):
@@ -296,16 +322,17 @@ class LivenessDetector:
         
         if not landmarks or "nose_tip" not in landmarks:
             return False, "No facial landmarks detected"
-            
-        # Initialize the reference position if not set
-        if self.initial_face_position is None:
-            self.initial_face_position = landmarks
-            self.movement_history = []
-            return False, "Initial position captured for verification"
-            
-        # Get current nose position
+        
+        # Extract current nose position
         curr_nose_x = sum(point[0] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
         curr_nose_y = sum(point[1] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
+        
+        # Always reset if we're just starting the verification or if substantial movement occurred
+        if self.initial_face_position is None or self.movement_history is None:
+            self.initial_face_position = landmarks
+            self.movement_history = []
+            self.stable_frame_count = 0
+            return False, "Initial position captured for verification"
         
         # Get reference nose position
         ref_nose_x = sum(point[0] for point in self.initial_face_position["nose_tip"]) / len(self.initial_face_position["nose_tip"])
@@ -316,17 +343,31 @@ class LivenessDetector:
         
         # Keep track of movement history for stability analysis
         self.movement_history.append(movement)
-        if len(self.movement_history) > 10:  # Track last 30 frames
+        if len(self.movement_history) > 15:  # Track last 15 frames
             self.movement_history.pop(0)
         
+        # If large movement detected, reset the reference position
+        if movement > 25:  # Large movement threshold
+            self.initial_face_position = landmarks
+            self.movement_history = []
+            self.stable_frame_count = 0
+            return False, "Movement detected. Please stay still."
+        
         # Check if movement is below threshold (stable position)
-        # FIXED: Reduced required stable frames from 15 to 10
         threshold = 10  # Threshold for considering movement insignificant
-        if len(self.movement_history) >= 10 and all(m < threshold for m in self.movement_history[-10:]):
+        
+        # Count consecutive stable frames
+        if movement < threshold:
+            self.stable_frame_count = getattr(self, 'stable_frame_count', 0) + 1
+        else:
+            self.stable_frame_count = 0
+        
+        # Need 15 consecutive stable frames
+        if self.stable_frame_count >= 15:
             self.final_verification_complete = True
             return True, "Verification complete - user is staying still"
-            
-        return False, f"Continue staying still ({len(self.movement_history)}/10 frames)"
+        
+        return False, f"Continue staying still ({self.stable_frame_count}/15 frames)"
     
     def _calculate_ear(self, eye_points):
         """Calculate Eye Aspect Ratio for blink detection"""
@@ -383,6 +424,8 @@ class LivenessDetector:
             self.challenge_index += 1
             # Reset for the next challenge
             self.previous_landmarks = None
+            self.ear_history = []
+            self.position_history = []
             
         return result, message
         
@@ -392,6 +435,7 @@ class LivenessDetector:
             return False
         return (len(self.completed_challenges) == len(self.current_challenges) and 
                 self.final_verification_complete)
+
 
 def get_challenge_instructions(challenge):
     """Return user-friendly instructions for each challenge type"""
