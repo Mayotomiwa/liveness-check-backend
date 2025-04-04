@@ -189,142 +189,142 @@ class LivenessDetector:
         
         return landmarks
     def detect_blink(self, image_data):
-    """Detect if the person blinked using MediaPipe landmarks"""
-    landmarks = self.get_facial_landmarks(image_data)
-    
-    if not landmarks or "left_eye" not in landmarks or "right_eye" not in landmarks:
-        return False, "Could not detect eyes"
-    
-    # Calculate Eye Aspect Ratio (EAR) for both eyes
-    left_ear = self._calculate_ear(landmarks["left_eye"])
-    right_ear = self._calculate_ear(landmarks["right_eye"])
-    
-    # Lower threshold makes it easier to detect blinks
-    threshold = 0.2  # Lowered from 0.23
-    
-    # Store historical EAR values to detect an actual blink sequence
-    avg_ear = (left_ear + right_ear) / 2
-    self.ear_history.append(avg_ear)
-    if len(self.ear_history) > 10:  # Keep fewer frames for faster detection
-        self.ear_history.pop(0)
-    
-    # Much more lenient blink detection
-    blink_detected = False
-    if len(self.ear_history) >= 3:  # Reduced from 4 to 3 frames
-        # Simpler pattern detection: was open, then closed
-        if (max(self.ear_history[:-2]) > threshold and  # Was open earlier
-            min(self.ear_history[-2:]) < threshold * 1.2):  # Closed with higher tolerance
-            blink_detected = True
-    
-    # Detect blink with faster confirmation
-    if blink_detected:
-        # Lower the bar for consistent detection
-        if self.last_detected_action == "blink":
-            self.action_detection_counter += 1.5  # Increase counter faster
-        else:
-            self.last_detected_action = "blink"
-            self.action_detection_counter = 1
-            
-        # Only need to see the action once clearly
-        self.consecutive_action_threshold = 1  # Reduced from 2
+        """Detect if the person blinked using MediaPipe landmarks"""
+        landmarks = self.get_facial_landmarks(image_data)
         
-        # Return true once we've reached the threshold
-        if self.action_detection_counter >= self.consecutive_action_threshold:
-            return True, "Blink detected"
-    else:
-        # Slower decay for intermittent detection
-        if self.last_detected_action == "blink" and self.action_detection_counter > 0:
-            self.action_detection_counter = max(0, self.action_detection_counter - 0.3)  # Reduced from 0.5
+        if not landmarks or "left_eye" not in landmarks or "right_eye" not in landmarks:
+            return False, "Could not detect eyes"
+        
+        # Calculate Eye Aspect Ratio (EAR) for both eyes
+        left_ear = self._calculate_ear(landmarks["left_eye"])
+        right_ear = self._calculate_ear(landmarks["right_eye"])
+        
+        # Lower threshold makes it easier to detect blinks
+        threshold = 0.2  # Lowered from 0.23
+        
+        # Store historical EAR values to detect an actual blink sequence
+        avg_ear = (left_ear + right_ear) / 2
+        self.ear_history.append(avg_ear)
+        if len(self.ear_history) > 10:  # Keep fewer frames for faster detection
+            self.ear_history.pop(0)
+        
+        # Much more lenient blink detection
+        blink_detected = False
+        if len(self.ear_history) >= 3:  # Reduced from 4 to 3 frames
+            # Simpler pattern detection: was open, then closed
+            if (max(self.ear_history[:-2]) > threshold and  # Was open earlier
+                min(self.ear_history[-2:]) < threshold * 1.2):  # Closed with higher tolerance
+                blink_detected = True
+        
+        # Detect blink with faster confirmation
+        if blink_detected:
+            # Lower the bar for consistent detection
+            if self.last_detected_action == "blink":
+                self.action_detection_counter += 1.5  # Increase counter faster
+            else:
+                self.last_detected_action = "blink"
+                self.action_detection_counter = 1
+                
+            # Only need to see the action once clearly
+            self.consecutive_action_threshold = 1  # Reduced from 2
             
-    return False, "No blink detected"
+            # Return true once we've reached the threshold
+            if self.action_detection_counter >= self.consecutive_action_threshold:
+                return True, "Blink detected"
+        else:
+            # Slower decay for intermittent detection
+            if self.last_detected_action == "blink" and self.action_detection_counter > 0:
+                self.action_detection_counter = max(0, self.action_detection_counter - 0.3)  # Reduced from 0.5
+                
+        return False, "No blink detected"
 
-def detect_head_movement(self, image_data, movement_type):
-    """Detect head nodding or turning using MediaPipe landmarks"""
-    landmarks = self.get_facial_landmarks(image_data)
-    
-    if not landmarks or "nose_tip" not in landmarks:
-        return False, "No facial landmarks detected"
-    
-    # Get nose position
-    curr_x = sum(point[0] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
-    curr_y = sum(point[1] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
-    
-    # Store position history
-    self.position_history.append((curr_x, curr_y))
-    if len(self.position_history) > 15:  # Reduced from 20 for faster detection
-        self.position_history.pop(0)
-    
-    # If we don't have enough history yet, just return
-    if len(self.position_history) < 3:  # Reduced from 5 for faster detection
-        self.previous_landmarks = landmarks
-        return False, "Collecting initial position data"
-    
-    action_detected = False
-    message = "No movement detected"
-    detected_action = None
-    
-    # For turn detection, analyze the movement sequence
-    if movement_type in ["turn_right", "turn_left"]:
-        # Calculate x positions (fewer frames)
-        x_positions = [pos[0] for pos in self.position_history[-8:]]  # Reduced from 10
+    def detect_head_movement(self, image_data, movement_type):
+        """Detect head nodding or turning using MediaPipe landmarks"""
+        landmarks = self.get_facial_landmarks(image_data)
         
-        # For right turn: need rightward movement (increasing x)
-        if movement_type == "turn_right":
-            # Reduced threshold from 15 to 10 pixels
-            if (x_positions[-1] - x_positions[0]) > 10:  # More sensitive rightward movement detection
-                # Much more tolerant consistency check
-                consistent_count = sum(1 for i in range(len(x_positions)-1) if x_positions[i] <= x_positions[i+1] + 10)
-                if consistent_count >= len(x_positions) * 0.6:  # Only require 60% consistency (was 70%)
-                    action_detected = True
-                    detected_action = "turn_right"
-                    message = "Right turn detected"
+        if not landmarks or "nose_tip" not in landmarks:
+            return False, "No facial landmarks detected"
         
-        # For left turn: need leftward movement (decreasing x)
-        elif movement_type == "turn_left":
-            # Reduced threshold from 15 to 10 pixels
-            if (x_positions[0] - x_positions[-1]) > 10:  # More sensitive leftward movement detection
-                # Much more tolerant consistency check
-                consistent_count = sum(1 for i in range(len(x_positions)-1) if x_positions[i] >= x_positions[i+1] - 10)
-                if consistent_count >= len(x_positions) * 0.6:  # Only require 60% consistency (was 70%)
-                    action_detected = True
-                    detected_action = "turn_left"
-                    message = "Left turn detected"
-    
-    # Handle nodding with similar improvements
-    elif movement_type == "nod":
-        # Calculate y positions
-        y_positions = [pos[1] for pos in self.position_history[-8:]]  # Fewer frames
-        # Reduced threshold from 12 to 8
-        y_range = max(y_positions) - min(y_positions)
-        if y_range > 8:  # Much more sensitive
-            action_detected = True
-            detected_action = "nod"
-            message = "Nod detected"
-    
-    # Check if we're detecting the action
-    if detected_action == movement_type:
-        if self.last_detected_action == detected_action:
-            self.action_detection_counter += 1.5  # Increase counter faster
+        # Get nose position
+        curr_x = sum(point[0] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
+        curr_y = sum(point[1] for point in landmarks["nose_tip"]) / len(landmarks["nose_tip"])
+        
+        # Store position history
+        self.position_history.append((curr_x, curr_y))
+        if len(self.position_history) > 15:  # Reduced from 20 for faster detection
+            self.position_history.pop(0)
+        
+        # If we don't have enough history yet, just return
+        if len(self.position_history) < 3:  # Reduced from 5 for faster detection
+            self.previous_landmarks = landmarks
+            return False, "Collecting initial position data"
+        
+        action_detected = False
+        message = "No movement detected"
+        detected_action = None
+        
+        # For turn detection, analyze the movement sequence
+        if movement_type in ["turn_right", "turn_left"]:
+            # Calculate x positions (fewer frames)
+            x_positions = [pos[0] for pos in self.position_history[-8:]]  # Reduced from 10
+            
+            # For right turn: need rightward movement (increasing x)
+            if movement_type == "turn_right":
+                # Reduced threshold from 15 to 10 pixels
+                if (x_positions[-1] - x_positions[0]) > 10:  # More sensitive rightward movement detection
+                    # Much more tolerant consistency check
+                    consistent_count = sum(1 for i in range(len(x_positions)-1) if x_positions[i] <= x_positions[i+1] + 10)
+                    if consistent_count >= len(x_positions) * 0.6:  # Only require 60% consistency (was 70%)
+                        action_detected = True
+                        detected_action = "turn_right"
+                        message = "Right turn detected"
+            
+            # For left turn: need leftward movement (decreasing x)
+            elif movement_type == "turn_left":
+                # Reduced threshold from 15 to 10 pixels
+                if (x_positions[0] - x_positions[-1]) > 10:  # More sensitive leftward movement detection
+                    # Much more tolerant consistency check
+                    consistent_count = sum(1 for i in range(len(x_positions)-1) if x_positions[i] >= x_positions[i+1] - 10)
+                    if consistent_count >= len(x_positions) * 0.6:  # Only require 60% consistency (was 70%)
+                        action_detected = True
+                        detected_action = "turn_left"
+                        message = "Left turn detected"
+        
+        # Handle nodding with similar improvements
+        elif movement_type == "nod":
+            # Calculate y positions
+            y_positions = [pos[1] for pos in self.position_history[-8:]]  # Fewer frames
+            # Reduced threshold from 12 to 8
+            y_range = max(y_positions) - min(y_positions)
+            if y_range > 8:  # Much more sensitive
+                action_detected = True
+                detected_action = "nod"
+                message = "Nod detected"
+        
+        # Check if we're detecting the action
+        if detected_action == movement_type:
+            if self.last_detected_action == detected_action:
+                self.action_detection_counter += 1.5  # Increase counter faster
+            else:
+                self.last_detected_action = detected_action
+                self.action_detection_counter = 1
+            
+            # Need fewer confirmations
+            self.consecutive_action_threshold = 1  # Reduced from 2
+            
+            # Return true if we've seen the action enough times
+            if self.action_detection_counter >= self.consecutive_action_threshold:
+                # Reset for next challenge
+                self.position_history = []
+                self.previous_landmarks = None
+                return True, message
         else:
-            self.last_detected_action = detected_action
-            self.action_detection_counter = 1
+            # Slower decay
+            if self.last_detected_action == movement_type and self.action_detection_counter > 0:
+                self.action_detection_counter = max(0, self.action_detection_counter - 0.3)  # Reduced from 0.5
         
-        # Need fewer confirmations
-        self.consecutive_action_threshold = 1  # Reduced from 2
-        
-        # Return true if we've seen the action enough times
-        if self.action_detection_counter >= self.consecutive_action_threshold:
-            # Reset for next challenge
-            self.position_history = []
-            self.previous_landmarks = None
-            return True, message
-    else:
-        # Slower decay
-        if self.last_detected_action == movement_type and self.action_detection_counter > 0:
-            self.action_detection_counter = max(0, self.action_detection_counter - 0.3)  # Reduced from 0.5
-    
-    self.previous_landmarks = landmarks
-    return False, "Continue " + get_challenge_instructions(movement_type).lower()
+        self.previous_landmarks = landmarks
+        return False, "Continue " + get_challenge_instructions(movement_type).lower()
     def verify_still(self, image_data):
         """Verify the user is staying still for the final verification step"""
         landmarks = self.get_facial_landmarks(image_data)
@@ -446,26 +446,26 @@ def detect_head_movement(self, image_data, movement_type):
                 self.final_verification_complete)
 
 
-def get_challenge_instructions(challenge):
-    """Return user-friendly instructions for each challenge type"""
-    instructions = {
-        "blink": "Please blink your eyes",
-        "nod": "Please nod your head up and down",
-        "turn_right": "Please turn your head to the right",
-        "turn_left": "Please turn your head to the left",
-        "stay_still": "Please stay still for final verification",
-        VERIFICATION_FAILED_FLAG: "Verification failed. Please restart the process."
-    }
-    return instructions.get(challenge, "Follow the instructions on screen")
+    def get_challenge_instructions(challenge):
+        """Return user-friendly instructions for each challenge type"""
+        instructions = {
+            "blink": "Please blink your eyes",
+            "nod": "Please nod your head up and down",
+            "turn_right": "Please turn your head to the right",
+            "turn_left": "Please turn your head to the left",
+            "stay_still": "Please stay still for final verification",
+            VERIFICATION_FAILED_FLAG: "Verification failed. Please restart the process."
+        }
+        return instructions.get(challenge, "Follow the instructions on screen")
 
-if init_data.get('sessionId') in active_sessions:
-    saved_session = active_sessions[init_data.get('sessionId')]
-    detector = saved_session['detector']
-    detector.challenge_index = saved_session['challenge_index']
-    detector.ear_history = saved_session['ear_history']
-    detector.position_history = saved_session['position_history']
-    detector.last_detected_action = saved_session['last_detected_action']
-    detector.action_detection_counter = saved_session['action_detection_counter']
+        if init_data.get('sessionId') in active_sessions:
+            saved_session = active_sessions[init_data.get('sessionId')]
+            detector = saved_session['detector']
+            detector.challenge_index = saved_session['challenge_index']
+            detector.ear_history = saved_session['ear_history']
+            detector.position_history = saved_session['position_history']
+            detector.last_detected_action = saved_session['last_detected_action']
+            detector.action_detection_counter = saved_session['action_detection_counter']
 
 
 @app.websocket("/ws")
