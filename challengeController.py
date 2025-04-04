@@ -23,12 +23,13 @@ logger = logging.getLogger("liveness-detector")
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-# Constants
-CHALLENGE_TIMEOUT = 50  # 50 seconds per challenge
-PING_INTERVAL = 15      # Send ping every 15 seconds (Render free tier needs frequent pings)
+# Constants - Updated values
+CHALLENGE_TIMEOUT = 45  # Reduced from 50 to 45 seconds
+PING_INTERVAL = 10      # Reduced from 15 to 10 seconds
 CONNECTION_TIMEOUT = 60  # Overall connection timeout
-MAX_MULTIPLE_FACE_DETECTIONS = 3  # After this many detections of multiple faces, fail verification
-VERIFICATION_FAILED_FLAG = "verification_failed"  # Flag for permanently failed verification
+MAX_MULTIPLE_FACE_DETECTIONS = 3
+VERIFICATION_FAILED_FLAG = "verification_failed"
+SESSION_TIMEOUT = 300    # 5 minutes for session timeout
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -460,8 +461,10 @@ async def websocket_endpoint(websocket: WebSocket):
     session_id = None
     detector = None
     last_activity = time.time()
+    last_pong = time.time()  # Track last pong time
     ping_task = None
     challenge_timer = None
+    session_timer = None
 
     async def send_ping():
         """Regularly send ping messages to keep connection alive"""
@@ -488,12 +491,26 @@ async def websocket_endpoint(websocket: WebSocket):
         except asyncio.CancelledError:
             pass
 
+    async def session_timeout_handler():
+        """Handle overall session timeout"""
+        try:
+            await asyncio.sleep(SESSION_TIMEOUT)
+            if websocket.client_state == 1:  # 1 = CONNECTED
+                await websocket.send_text(json.dumps({
+                    'type': 'error',
+                    'message': f'Session timed out after {SESSION_TIMEOUT} seconds'
+                }))
+                await websocket.close(code=1008)
+        except asyncio.CancelledError:
+            pass
+
     try:
         # Initial handshake with timeout
         try:
             data = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
             init_data = json.loads(data)
             last_activity = time.time()
+            last_pong = time.time()
             
             if init_data.get('type') == 'ping':
                 await websocket.send_text(json.dumps({'type': 'pong'}))
@@ -515,11 +532,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 challenges = detector.generate_challenges(3)
                 active_sessions[session_id] = {
                     'detector': detector,
-                    'last_active': time.time()
+                    'last_active': time.time(),
+                    'challenges': challenges,
+                    'completed': []
                 }
                 
                 # Start ping task
                 ping_task = asyncio.create_task(send_ping())
+                # Start session timer
+                session_timer = asyncio.create_task(session_timeout_handler())
                 
                 # Send session info
                 await websocket.send_text(json.dumps({
@@ -528,7 +549,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     'challenges': challenges,
                     'currentChallenge': detector.get_current_challenge(),
                     'instructions': get_challenge_instructions(detector.get_current_challenge()),
-                    'timeout': CHALLENGE_TIMEOUT
+                    'timeout': CHALLENGE_TIMEOUT,
+                    'sessionTimeout': SESSION_TIMEOUT
                 }))
                 
                 # Main processing loop
@@ -538,6 +560,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         if time.time() - last_activity > CONNECTION_TIMEOUT:
                             logger.info(f"Connection timeout for {session_id}")
                             await websocket.close(code=1008)
+                            break
+                            
+                        # Check pong response
+                        if time.time() - last_pong > PING_INTERVAL * 2:
+                            logger.warning(f"No pong received for {session_id}")
+                            await websocket.close(code=4003)
                             break
                             
                         # Receive data with timeout
@@ -552,6 +580,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         # Handle ping/pong
                         if message.get('type') == 'ping':
                             await websocket.send_text(json.dumps({'type': 'pong'}))
+                            continue
+                        elif message.get('type') == 'pong':
+                            last_pong = time.time()
                             continue
                             
                         # Process frame messages
@@ -611,7 +642,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                     'challengesCompleted': list(detector.completed_challenges),
                                     'challengesTotal': len(detector.current_challenges),
                                     'allCompleted': detector.is_liveness_verified(),
-                                    'timeRemaining': CHALLENGE_TIMEOUT - (time.time() - last_activity)
+                                    'timeRemaining': CHALLENGE_TIMEOUT - (time.time() - last_activity),
+                                    'sessionTimeRemaining': SESSION_TIMEOUT - (time.time() - last_activity)
                                 }
                                 await websocket.send_text(json.dumps(response))
                                 
@@ -619,7 +651,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                     await websocket.send_text(json.dumps({
                                         'type': 'complete',
                                         'success': True,
-                                        'message': "Liveness verification complete"
+                                        'message': "Liveness verification complete",
+                                        'sessionId': session_id
                                     }))
                                     break
                                     
@@ -641,6 +674,14 @@ async def websocket_endpoint(websocket: WebSocket):
             
     except WebSocketDisconnect as e:
         logger.info(f"Client disconnected: {session_id} (code: {e.code})")
+        # Save session state for possible reconnection
+        if session_id and detector:
+            active_sessions[session_id] = {
+                'detector': detector,
+                'last_active': time.time(),
+                'challenges': detector.current_challenges,
+                'completed': list(detector.completed_challenges)
+            }
     except json.JSONDecodeError:
         logger.error("Invalid JSON received")
         await websocket.close(code=4000)
@@ -657,18 +698,28 @@ async def websocket_endpoint(websocket: WebSocket):
         # Clean up resources
         if challenge_timer and not challenge_timer.done():
             challenge_timer.cancel()
+        if session_timer and not session_timer.done():
+            session_timer.cancel()
         if ping_task and not ping_task.done():
             ping_task.cancel()
-        if session_id in active_sessions:
-            del active_sessions[session_id]
         try:
             await websocket.close()
         except:
             pass
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "sessions": len(active_sessions)}
+@app.get("/session/{session_id}")
+async def get_session_state(session_id: str):
+    """Endpoint to check session state for reconnection"""
+    if session_id in active_sessions:
+        session = active_sessions[session_id]
+        return {
+            "status": "active",
+            "sessionId": session_id,
+            "challenges": session['challenges'],
+            "completed": session['completed'],
+            "last_active": time.time() - session['last_active']
+        }
+    return {"status": "not_found"}
 
 async def main():
     config = Config(
