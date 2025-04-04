@@ -47,12 +47,12 @@ class LivenessDetector:
         self.final_verification_complete = False
         
         # Initialize MediaPipe Face Mesh
-  mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+        mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
             
         # Define landmarks indices for specific facial features
         self.LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
@@ -519,9 +519,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         # Initial handshake with timeout
-# Reduce initial handshake timeout
-try:
-    data = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)  # 10.0 to 5.0            init_data = json.loads(data)
+        try:
+            data = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)  # 10.0 to 5.0            init_data = json.loads(data)
             last_activity = time.time()
             last_pong = time.time()
             
